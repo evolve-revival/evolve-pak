@@ -81,6 +81,21 @@ func DecryptEOCDComment(comment, overrideKey []byte) (*KeyRing, error) {
 	return nil, errors.New("EOCD: RSA+OAEP decode failed with all available keys")
 }
 
+// RekeyEOCDComment decrypts the key table from the 2320-byte EOCD comment
+// using srcPubDER (pass nil to use the embedded vanilla RSA public key), then
+// re-encrypts it using dstPrivDER (PKCS#1 DER RSA-1024 private key). Returns
+// a new 2320-byte EOCD comment suitable for writing back over the tail of the
+// pak file.
+//
+// Only the EOCD comment changes; LFHs, entry data, and the CDR are untouched.
+func RekeyEOCDComment(comment, srcPubDER, dstPrivDER []byte) ([]byte, error) {
+	kr, err := DecryptEOCDComment(comment, srcPubDER)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	return buildEOCDComment(dstPrivDER, kr.Keys, kr.CDRIV)
+}
+
 func decryptKeyTable(comment, derKey []byte) (*KeyRing, error) {
 	ivBlock := comment[ivEncOff : ivEncOff+128]
 	ivPlain, err := crypto.RSAPublicDecryptOAEP(derKey, ivBlock)

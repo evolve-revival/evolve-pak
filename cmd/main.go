@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,22 @@ var keygenCmd = &cobra.Command{
 	Short: "Generate an RSA-1024 keypair for signing custom pak files",
 	Args:  cobra.NoArgs,
 	RunE:  runKeygen,
+}
+
+var rekeyCmd = &cobra.Command{
+	Use:   "rekey <game-dir>",
+	Short: "Re-sign all vanilla pak EOCD comments with the revival private key",
+	Long: `rekey walks every .pak file under <game-dir> and verifies that its EOCD
+comment is signed with the vanilla RSA public key.  Without --in-place it
+only validates; no files are modified.
+
+With --in-place it re-encrypts the 16 Twofish keys and CDR IV under the
+revival private key (revival.priv from keygen) and writes the new 2320-byte
+EOCD comment back over the existing one.  All entry data and the CDR are
+untouched.  Run on a staging copy of the game directory, never on the live
+install.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRekey,
 }
 
 func runList(_ *cobra.Command, args []string) error {
@@ -204,7 +221,149 @@ var (
 	keygenOutDir  string
 	keygenForce   bool
 	packPrivKey   string
+	rekeyPrivKey  string
+	rekeyInPlace  bool
 )
+
+func runRekey(_ *cobra.Command, args []string) error {
+	gameDir := args[0]
+
+	var privDER, pubDER []byte
+	if rekeyInPlace {
+		if rekeyPrivKey == "" {
+			return fmt.Errorf("--privkey is required with --in-place (run 'evolve-pak keygen' first)")
+		}
+		var err error
+		privDER, err = os.ReadFile(rekeyPrivKey)
+		if err != nil {
+			return fmt.Errorf("read private key: %w", err)
+		}
+		priv, err := x509.ParsePKCS1PrivateKey(privDER)
+		if err != nil {
+			return fmt.Errorf("parse private key: %w", err)
+		}
+		pubDER = x509.MarshalPKCS1PublicKey(&priv.PublicKey)
+	}
+
+	var pakPaths []string
+	err := filepath.WalkDir(gameDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.EqualFold(filepath.Ext(path), ".pak") {
+			pakPaths = append(pakPaths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk %s: %w", gameDir, err)
+	}
+	if len(pakPaths) == 0 {
+		return fmt.Errorf("no .pak files found under %s", gameDir)
+	}
+
+	if rekeyInPlace {
+		fmt.Printf("Rekeying %d pak files in-place under %s...\n", len(pakPaths), gameDir)
+	} else {
+		fmt.Printf("Validating %d pak files under %s (dry run — use --in-place to modify)...\n", len(pakPaths), gameDir)
+	}
+
+	var ok, skipped, failed int
+	for _, path := range pakPaths {
+		rel, _ := filepath.Rel(gameDir, path)
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  SKIP  %s: stat: %v\n", rel, err)
+			skipped++
+			continue
+		}
+		if fi.Size() < 2320 {
+			fmt.Fprintf(os.Stderr, "  SKIP  %s: file too small (%d bytes)\n", rel, fi.Size())
+			skipped++
+			continue
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  SKIP  %s: open: %v\n", rel, err)
+			skipped++
+			continue
+		}
+		comment := make([]byte, 2320)
+		_, readErr := f.ReadAt(comment, fi.Size()-2320)
+		f.Close()
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "  SKIP  %s: read comment: %v\n", rel, readErr)
+			skipped++
+			continue
+		}
+
+		if !rekeyInPlace {
+			// Validate only: confirm vanilla key decrypts this EOCD.
+			if _, err := pak.DecryptEOCDComment(comment, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "  FAIL  %s: %v\n", rel, err)
+				failed++
+			} else {
+				fmt.Printf("  OK    %s\n", rel)
+				ok++
+			}
+			continue
+		}
+
+		// In-place rekey.
+		newComment, err := pak.RekeyEOCDComment(comment, nil, privDER)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: rekey: %v\n", rel, err)
+			failed++
+			continue
+		}
+
+		fw, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: open for write: %v\n", rel, err)
+			failed++
+			continue
+		}
+		_, writeErr := fw.WriteAt(newComment, fi.Size()-2320)
+		fw.Close()
+		if writeErr != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: write: %v\n", rel, writeErr)
+			failed++
+			continue
+		}
+
+		// Post-write verification: re-read and decrypt with the new public key.
+		fv, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: verify open: %v\n", rel, err)
+			failed++
+			continue
+		}
+		verify := make([]byte, 2320)
+		_, verErr := fv.ReadAt(verify, fi.Size()-2320)
+		fv.Close()
+		if verErr != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: verify read: %v\n", rel, verErr)
+			failed++
+			continue
+		}
+		if _, err := pak.DecryptEOCDComment(verify, pubDER); err != nil {
+			fmt.Fprintf(os.Stderr, "  FAIL  %s: post-write verify: %v\n", rel, err)
+			failed++
+			continue
+		}
+
+		fmt.Printf("  OK    %s\n", rel)
+		ok++
+	}
+
+	fmt.Printf("\n%d ok, %d skipped, %d failed  (total %d)\n", ok, skipped, failed, len(pakPaths))
+	if failed > 0 {
+		return fmt.Errorf("%d pak(s) failed", failed)
+	}
+	return nil
+}
 
 func runAudit(_ *cobra.Command, args []string) error {
 	if auditContents {
@@ -297,7 +456,9 @@ func init() {
 	packCmd.Flags().StringVar(&packPrivKey, "privkey", "", "path to revival.priv (from keygen)")
 	keygenCmd.Flags().StringVar(&keygenOutDir, "out-dir", ".", "directory to write revival.priv and revival.pub")
 	keygenCmd.Flags().BoolVar(&keygenForce, "force", false, "overwrite existing key files")
-	rootCmd.AddCommand(listCmd, extractCmd, inspectCmd, auditCmd, perfCmd, packCmd, keyfindCmd, keygenCmd)
+	rekeyCmd.Flags().StringVar(&rekeyPrivKey, "privkey", "", "path to revival.priv (required with --in-place)")
+	rekeyCmd.Flags().BoolVar(&rekeyInPlace, "in-place", false, "write new EOCD comments back to the pak files")
+	rootCmd.AddCommand(listCmd, extractCmd, inspectCmd, auditCmd, perfCmd, packCmd, keyfindCmd, keygenCmd, rekeyCmd)
 }
 
 func humanBytes(b int64) string {
